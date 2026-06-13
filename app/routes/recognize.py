@@ -1,65 +1,60 @@
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, current_app
+from app.models import get_db
+from app.utils.decorators import token_required, rate_limit  # Наш рабочий фикс авторизации
 from app.services.ai_service import AIService
 from app.services.bonus_service import BonusService
-from app.routes.chat import get_user_from_token
-from app.models import get_db
-import base64
+from app.services.achievement_service import AchievementService
 
+# ФИКС: Создаем объект Blueprint, чтобы Flask видел этот роут
 bp = Blueprint('recognize', __name__)
 
 @bp.route('/recognize', methods=['POST'])
-def recognize():
-    user_id = get_user_from_token()
+@token_required  # Извлекает user_id из JWT токена автоматически
+@rate_limit(limit=5, period=60)  # Защита от спама: макс 5 фото в минуту
+def recognize_place():
+    user_id = request.user_id
     
+    # Проверяем, прикрепил ли пользователь файл изображения
     if 'image' not in request.files:
-        return jsonify({"error": "Файл изображения не найден"}), 400
-    
+        return jsonify({"error": "Файл изображения отсутствует в запросе"}), 400
+        
     file = request.files['image']
     if file.filename == '':
         return jsonify({"error": "Файл не выбран"}), 400
-    
-    # Проверка размера
-    file.seek(0, 2)
-    size = file.tell()
-    file.seek(0)
-    
-    if size > 5 * 1024 * 1024:  # 5MB
-        return jsonify({"error": "Файл слишком большой (макс. 5MB)"}), 413
-    
+        
     try:
+        # Читаем байты картинки для передачи в OpenAI
         image_bytes = file.read()
-        result_text = AIService.recognize_landmark(image_bytes)
         
-        # Если пользователь авторизован, сохраняем историю и начисляем бонус
-        if user_id:
-            conn = get_db()
-            conn.execute(
-                "INSERT INTO scan_history (user_id, image_data, result) VALUES (?, ?, ?)",
-                (user_id, base64.b64encode(image_bytes).decode('utf-8'), result_text)
-            )
-            conn.commit()
-            conn.close()
-            
-            # Начисляем 5 баллов за распознавание (макс 10 в день)
-            BonusService.add_points(user_id, 5, 'scan_photo', max_per_day=10)
+        # Вызываем наш оптимизированный ИИ-сервис (с кэшированием)
+        ai_result = AIService.recognize_landmark(image_bytes)
         
-        return jsonify({"analysis": result_text}), 200
+        # Сохраняем успешное сканирование в историю
+        conn = get_db()
+        conn.execute("""
+            INSERT INTO scan_history (user_id, result) 
+            VALUES (?, ?)
+        """, (user_id, ai_result))
+        conn.commit()
+        
+        # Начисляем 5 баллов за распознавание (максимум 10 баллов в день)
+        BonusService.add_points(user_id, 5, 'scan_photo', max_per_day=10)
+        
+        # Триггерим фоновую проверку ачивок (например, "Первое сканирование")
+        new_achievements = AchievementService.check_and_update_achievements(user_id)
+        
+        # Вытягиваем свежий баланс для мгновенного обновления плашки на фронтенде
+        user_data = conn.execute("SELECT bonus_points FROM users WHERE id = ?", (user_id,)).fetchone()
+        current_balance = user_data['bonus_points'] if user_data else 0
+        conn.close()
+        
+        return jsonify({
+            "success": True,
+            "result": ai_result,
+            "current_balance": current_balance,  # Передаем на фронт
+            "new_achievements": new_achievements  # Список открытых ачивок
+        }), 200
         
     except Exception as e:
-        return jsonify({"error": f"Ошибка обработки: {str(e)}"}), 500
-
-@bp.route('/recognize/history', methods=['GET'])
-def get_scan_history():
-    user_id = get_user_from_token()
-    if not user_id:
-        return jsonify({"error": "Требуется авторизация"}), 401
-    
-    conn = get_db()
-    rows = conn.execute(
-        "SELECT id, result, created_at FROM scan_history WHERE user_id = ? ORDER BY created_at DESC LIMIT 20",
-        (user_id,)
-    ).fetchall()
-    conn.close()
-    
-    history = [{"id": r['id'], "result": r['result'], "date": r['created_at']} for r in rows]
-    return jsonify({"history": history}), 200
+        print(f"🛑 Ошибка в роуте распознавания: {str(e)}")
+        return jsonify({"error": "Не удалось обработать изображение"}), 500

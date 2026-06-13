@@ -6,43 +6,46 @@ from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
-
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-if OPENAI_API_KEY:
-    client = OpenAI(api_key=OPENAI_API_KEY)
-else:
-    client = None
-    print("⚠️ OPENAI_API_KEY не задан")
-
-# Простой кэш в памяти (замени на Redis при наличии)
-_cache = {}
+_chat_cache = {}
+_scan_cache = {}
 
 class AIService:
     @staticmethod
-    def _get_cache_key(prompt, message, history):
-        """Генерирует ключ для кэша"""
-        content = f"{prompt}|{message}|{json.dumps(history)}"
+    def _get_chat_cache_key(prompt, message, history):
+        normalized = []
+        if history:
+            for msg in history:
+                normalized.append({
+                    "role": msg.get("role", msg.get("sender", "user")),
+                    "content": msg.get("content", msg.get("message", ""))
+                })
+        content = f"{prompt}|{message}|{json.dumps(normalized, sort_keys=True)}"
         return hashlib.md5(content.encode()).hexdigest()
     
     @staticmethod
+    def _get_scan_cache_key(image_bytes):
+        return hashlib.md5(image_bytes).hexdigest()
+
+    @staticmethod
     def chat_with_character(system_prompt, user_message, history=None):
         if not client:
-            return "⚠️ Сервис AI временно недоступен. Попробуйте позже."
+            return "⚠️ Сервис AI временно недоступен."
         
-        cache_key = AIService._get_cache_key(system_prompt, user_message, history)
-        
-        # Проверяем кэш
-        if cache_key in _cache:
-            return _cache[cache_key]
+        cache_key = AIService._get_chat_cache_key(system_prompt, user_message, history)
+        if cache_key in _chat_cache:
+            return _chat_cache[cache_key]
         
         messages = [{"role": "system", "content": system_prompt}]
-        
         if history:
-            for msg in history[-10:]:  # Последние 10 сообщений
-                role = "user" if msg['role'] == 'user' else "assistant"
-                messages.append({"role": role, "content": msg['content']})
-        
+            for msg in history[-10:]:
+                raw_role = msg.get('role', msg.get('sender', 'user'))
+                role = "user" if raw_role == 'user' else "assistant"
+                content = msg.get('content', msg.get('message', ''))
+                messages.append({"role": role, "content": content})
+                
         messages.append({"role": "user", "content": user_message})
         
         try:
@@ -53,9 +56,7 @@ class AIService:
                 temperature=0.7
             )
             result = response.choices[0].message.content
-            
-            # Сохраняем в кэш (на 1 час)
-            _cache[cache_key] = result
+            _chat_cache[cache_key] = result
             return result
         except Exception as e:
             return f"❌ Ошибка AI: {str(e)}"
@@ -65,8 +66,11 @@ class AIService:
         if not client:
             return "⚠️ Сервис распознавания временно недоступен"
         
+        scan_key = AIService._get_scan_cache_key(image_bytes)
+        if scan_key in _scan_cache:
+            return _scan_cache[scan_key]
+            
         image_base64 = base64.b64encode(image_bytes).decode("utf-8")
-        
         prompt = """Ты — эксперт-экскурсовод по Душанбе и Таджикистану.
 Определи достопримечательность на фото и дай интересную историческую справку.
 Если объект не из Душанбе/Таджикистана — вежливо сообщи об этом.
@@ -75,17 +79,17 @@ class AIService:
         try:
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
-                        ]
-                    }
-                ],
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
+                    ]
+                }],
                 max_tokens=600
             )
-            return response.choices[0].message.content
+            result = response.choices[0].message.content
+            _scan_cache[scan_key] = result
+            return result
         except Exception as e:
             return f"❌ Ошибка распознавания: {str(e)}"
