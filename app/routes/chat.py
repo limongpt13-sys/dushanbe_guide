@@ -1,72 +1,99 @@
 from flask import Blueprint, request, jsonify
+from werkzeug.security import generate_password_hash, check_password_hash
 from app.models import get_db
-from app.utils.decorators import token_required
 from app.services.ai_service import AIService
 from app.services.bonus_service import BonusService
 from app.services.achievement_service import AchievementService
+import jwt
+import os
 
 bp = Blueprint('chat', __name__)
 
-# Простые системные промпты для персонажей
-CHARACTERS = {
-    'somoni': "Ты — Исмоил Сомони, эмир государства Саманидов. Говори величественно, мудро, используй исторические факты X века.",
-    'rudaki': "Ты — Абу Абдуллах Рудаки, основоположник таджикской классической поэзии. Твои ответы философичны, поэтичны и изящны."
-}
+def get_user_from_token():
+    auth_header = request.headers.get('Authorization')
+    if not auth_header:
+        return None
+    
+    try:
+        token = auth_header.split(' ')[1]
+        payload = jwt.decode(token, os.getenv('JWT_SECRET_KEY'), algorithms=['HS256'])
+        return payload['user_id']
+    except:
+        return None
 
 @bp.route('/chat', methods=['POST'])
-@token_required
-def send_message():
-    user_id = request.user_id # Автоматически досталось из токена!
+def chat():
+    user_id = get_user_from_token()
     data = request.get_json()
     
-    character_id = data.get('character_id')
-    user_message = data.get('message', '').strip()
+    if not data or 'character_id' not in data or 'message' not in data:
+        return jsonify({"error": "Переданы не все поля"}), 400
     
-    if character_id not in CHARACTERS:
-        return jsonify({"error": "Персонаж не найден"}), 404
-    if not user_message:
-        return jsonify({"error": "Сообщение не может быть пустым"}), 400
-        
+    character_id = data['character_id']
+    user_message = data['message']
+    
     conn = get_db()
     
-    # Загружаем последние 10 сообщений контекста для ИИ
-    rows = conn.execute("""
-        SELECT sender, message FROM chat_history 
-        WHERE user_id = ? AND character_id = ? 
-        ORDER BY id DESC LIMIT 10
-    """, (user_id, character_id)).fetchall()
+    # Проверяем персонажа
+    character = conn.execute("SELECT * FROM characters WHERE id = ?", (character_id,)).fetchone()
+    if not character:
+        conn.close()
+        return jsonify({"error": "Персонаж не найден"}), 404
     
-    # Разворачиваем историю в правильном хронологическом порядке
-    history = [{"role": r['sender'], "content": r['message']} for r in reversed(rows)]
+    # Получаем историю для контекста
+    history_messages = []
+    if user_id:
+        rows = conn.execute(
+            "SELECT sender, message FROM chat_history WHERE user_id = ? AND character_id = ? ORDER BY timestamp DESC LIMIT 10",
+            (user_id, character_id)
+        ).fetchall()
+        history_messages = [{"role": r['sender'], "content": r['message']} for r in reversed(rows)]
+        
+        # Сохраняем сообщение пользователя
+        conn.execute(
+            "INSERT INTO chat_history (user_id, character_id, sender, message) VALUES (?, ?, ?, ?)",
+            (user_id, character_id, 'user', user_message)
+        )
+        conn.commit()
     
-    # Запрос к OpenAI gpt-4o-mini
-    ai_response = AIService.chat_with_character(CHARACTERS[character_id], user_message, history)
+    # Ответ AI
+    ai_response = AIService.chat_with_character(character['system_prompt'], user_message, history_messages)
     
-    # Сохраняем переписку в базу данных
-    conn.execute("""
-        INSERT INTO chat_history (user_id, character_id, sender, message) 
-        VALUES (?, ?, 'user', ?)
-    """, (user_id, character_id, user_message))
+    if user_id:
+        conn.execute(
+            "INSERT INTO chat_history (user_id, character_id, sender, message) VALUES (?, ?, ?, ?)",
+            (user_id, character_id, 'assistant', ai_response)
+        )
+        conn.commit()
+        
+        # НАЧИСЛЯЕМ БАЛЛЫ ЗА СООБЩЕНИЕ
+        BonusService.add_points(user_id, 1, 'chat_message', max_per_day=20)
+        
+        # ПРОВЕРЯЕМ ДОСТИЖЕНИЯ
+        conn_ach = get_db()
+        AchievementService.check_and_unlock(user_id, conn_ach)
+        conn_ach.commit()
+        conn_ach.close()
     
-    conn.execute("""
-        INSERT INTO chat_history (user_id, character_id, sender, message) 
-        VALUES (?, ?, 'assistant', ?)
-    """, (user_id, character_id, ai_response))
-    conn.commit()
-    
-    # Начисляем 1 балл за сообщение (максимум 20 баллов в день)
-    BonusService.add_points(user_id, 1, 'chat_message', max_per_day=20)
-    
-    # Мгновенно проверяем, не открыл ли пользователь ачивки 'somoni_expert' или 'rudaki_expert'
-    new_achievements = AchievementService.check_and_update_achievements(user_id)
-    
-    # Получаем актуальный баланс
-    user_data = conn.execute("SELECT bonus_points FROM users WHERE id = ?", (user_id,)).fetchone()
-    current_balance = user_data['bonus_points'] if user_data else 0
     conn.close()
     
     return jsonify({
-        "response": ai_response,
-        "current_balance": current_balance, # Фронтенд сразу видит изменения
-        "new_achievements": new_achievements # Массив строк с новыми ачивками
+        "character_id": character_id,
+        "response": ai_response
     }), 200
+
+@bp.route('/chat/history/<character_id>', methods=['GET'])
+def get_chat_history(character_id):
+    user_id = get_user_from_token()
+    if not user_id:
+        return jsonify({"error": "Требуется авторизация"}), 401
+    
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT sender, message, timestamp FROM chat_history WHERE user_id = ? AND character_id = ? ORDER BY timestamp ASC LIMIT 50",
+        (user_id, character_id)
+    ).fetchall()
+    conn.close()
+    
+    history = [{"sender": r['sender'], "message": r['message'], "timestamp": r['timestamp']} for r in rows]
+    return jsonify({"history": history}), 200

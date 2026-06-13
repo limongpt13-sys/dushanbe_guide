@@ -8,9 +8,10 @@ def create_app():
     app = Flask(__name__)
     app.config.from_object('app.config.Config')
     
+    # Включаем CORS для всех маршрутов
     CORS(app, origins=app.config['CORS_ORIGINS'], supports_credentials=True)
     
-    # Регистрация маршрутов
+    # Регистрация маршрутов с префиксом /api
     from app.routes import auth, chat, bonus, recognize, profile, leaderboard, achievements
     app.register_blueprint(auth.bp, url_prefix='/api')
     app.register_blueprint(chat.bp, url_prefix='/api')
@@ -20,7 +21,22 @@ def create_app():
     app.register_blueprint(leaderboard.bp, url_prefix='/api')
     app.register_blueprint(achievements.bp, url_prefix='/api')
     
-    # Health check
+    # Прямые роуты для совместимости
+    @app.route('/register', methods=['POST', 'OPTIONS'])
+    def register_redirect():
+        if request.method == 'OPTIONS':
+            return '', 200
+        from app.routes.auth import register
+        return register()
+    
+    @app.route('/login', methods=['POST', 'OPTIONS'])
+    def login_redirect():
+        if request.method == 'OPTIONS':
+            return '', 200
+        from app.routes.auth import login
+        return login()
+    
+    # Health check эндпоинт
     @app.route('/api/health', methods=['GET'])
     def health_check():
         from app.services.ai_service import AIService
@@ -30,3 +46,5 @@ def create_app():
     init_db()
     
     return app
+
+socketio = None

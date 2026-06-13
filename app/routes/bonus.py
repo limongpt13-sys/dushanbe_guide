@@ -1,38 +1,48 @@
 from flask import Blueprint, request, jsonify
 from app.models import get_db
 from app.services.bonus_service import BonusService
-from app.utils.decorators import token_required  # ФИКС: Подключаем рабочий декоратор
+from app.services.achievement_service import AchievementService
+from app.routes.chat import get_user_from_token
+import datetime
 
 bp = Blueprint('bonus', __name__)
 
 @bp.route('/bonus/balance', methods=['GET'])
-@token_required  # ФИКС: Автоматическая авторизация
 def get_balance():
-    user_id = request.user_id
+    user_id = get_user_from_token()
+    if not user_id:
+        return jsonify({"error": "Требуется авторизация"}), 401
     
     conn = get_db()
     user = conn.execute("SELECT bonus_points FROM users WHERE id = ?", (user_id,)).fetchone()
     conn.close()
     
-    if not user:
-        return jsonify({"error": "Пользователь не найден"}), 404
-        
     return jsonify({"bonus_points": user['bonus_points']}), 200
 
 @bp.route('/bonus/daily', methods=['POST'])
-@token_required  # ФИКС: Защита токеном
 def claim_daily_bonus():
-    user_id = request.user_id
+    user_id = get_user_from_token()
+    if not user_id:
+        return jsonify({"error": "Требуется авторизация"}), 401
     
-    # Метод BonusService теперь защищен от крашей с NULL-датами
     result = BonusService.claim_daily_bonus(user_id)
+    
+    # Если бонус успешно получен — проверяем достижения (стрик)
+    if result['success']:
+        conn_ach = get_db()
+        AchievementService.check_and_unlock(user_id, conn_ach)
+        conn_ach.commit()
+        conn_ach.close()
+    
     return jsonify(result), 200 if result['success'] else 400
 
 @bp.route('/bonus/redeem', methods=['POST'])
-@token_required  # ФИКС: Защита токеном
 def redeem_bonus():
-    user_id = request.user_id
-    data = request.get_json() or {}
+    user_id = get_user_from_token()
+    if not user_id:
+        return jsonify({"error": "Требуется авторизация"}), 401
+    
+    data = request.get_json()
     reward_id = data.get('reward_id')
     
     rewards = {
@@ -47,15 +57,11 @@ def redeem_bonus():
     conn = get_db()
     user = conn.execute("SELECT bonus_points FROM users WHERE id = ?", (user_id,)).fetchone()
     
-    if not user:
-        conn.close()
-        return jsonify({"error": "Пользователь не найден"}), 404
-        
     if user['bonus_points'] < rewards[reward_id]['points']:
         conn.close()
         return jsonify({"error": "Недостаточно баллов"}), 400
     
-    # Списание баллов и фиксация транзакции
+    # Списываем баллы
     conn.execute(
         "UPDATE users SET bonus_points = bonus_points - ? WHERE id = ?",
         (rewards[reward_id]['points'], user_id)
@@ -74,9 +80,10 @@ def redeem_bonus():
     }), 200
 
 @bp.route('/bonus/transactions', methods=['GET'])
-@token_required  # ФИКС: Защита токеном
 def get_transactions():
-    user_id = request.user_id
+    user_id = get_user_from_token()
+    if not user_id:
+        return jsonify({"error": "Требуется авторизация"}), 401
     
     conn = get_db()
     rows = conn.execute(
@@ -87,3 +94,44 @@ def get_transactions():
     
     transactions = [{"amount": r['amount'], "reason": r['reason'], "date": r['created_at']} for r in rows]
     return jsonify({"transactions": transactions}), 200
+
+@bp.route('/leaderboard', methods=['GET'])
+def get_leaderboard():
+    period = request.args.get('period', 'all')  # day, week, all
+    
+    conn = get_db()
+    
+    if period == 'day':
+        rows = conn.execute("""
+            SELECT u.id, u.username, u.full_name, SUM(b.amount) as points
+            FROM users u
+            JOIN bonus_transactions b ON u.id = b.user_id
+            WHERE DATE(b.created_at) = DATE('now')
+            GROUP BY u.id
+            ORDER BY points DESC
+            LIMIT 10
+        """).fetchall()
+    elif period == 'week':
+        rows = conn.execute("""
+            SELECT u.id, u.username, u.full_name, SUM(b.amount) as points
+            FROM users u
+            JOIN bonus_transactions b ON u.id = b.user_id
+            WHERE b.created_at >= DATE('now', '-7 days')
+            GROUP BY u.id
+            ORDER BY points DESC
+            LIMIT 10
+        """).fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT id, username, full_name, bonus_points as points
+            FROM users
+            ORDER BY bonus_points DESC
+            LIMIT 10
+        """).fetchall()
+    
+    conn.close()
+    
+    leaderboard = [{"rank": i+1, "username": r['username'], "full_name": r['full_name'], "points": r['points']} 
+                   for i, r in enumerate(rows)]
+    
+    return jsonify({"leaderboard": leaderboard, "period": period}), 200

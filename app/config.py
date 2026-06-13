@@ -10,8 +10,8 @@ class Config:
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
     REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
     
-    # ИСПРАВЛЕНО: разрешаем все источники для разработки
-    CORS_ORIGINS = ["*"]  # Для продакшена замените на конкретные домены
+    # Разрешаем все источники для разработки
+    CORS_ORIGINS = ["*"]
     
     MAX_CONTENT_LENGTH = 5 * 1024 * 1024  # 5MB
     RATELIMIT_REQUESTS = 100

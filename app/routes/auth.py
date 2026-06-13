@@ -1,72 +1,124 @@
-from flask import Blueprint, request, jsonify, current_app
-from app.models import get_db
+from flask import Blueprint, request, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
 import jwt
 import datetime
-from app.utils.validators import validate_email, validate_password, validate_username, validate_full_name, sanitize_input
+import os
+from app.models import get_db
 
 bp = Blueprint('auth', __name__)
 
+def generate_tokens(user_id):
+    """Генерирует access и refresh токены"""
+    access_token = jwt.encode(
+        {'user_id': user_id, 'exp': datetime.datetime.utcnow() + datetime.timedelta(minutes=15)},
+        os.getenv('JWT_SECRET_KEY', 'dev-secret-key'),
+        algorithm='HS256'
+    )
+    refresh_token = jwt.encode(
+        {'user_id': user_id, 'exp': datetime.datetime.utcnow() + datetime.timedelta(days=7)},
+        os.getenv('JWT_SECRET_KEY', 'dev-secret-key'),
+        algorithm='HS256'
+    )
+    return access_token, refresh_token
+
 @bp.route('/register', methods=['POST', 'OPTIONS'])
 def register():
-    if request.method == 'OPTIONS': return '', 200
+    # Обработка preflight запроса
+    if request.method == 'OPTIONS':
+        return '', 200
+    
     data = request.get_json()
     
+    # Валидация
     if not all(k in data for k in ('full_name', 'email', 'username', 'password')):
-        return jsonify({"error": "Заполни все поля!"}), 400
-        
-    full_name = sanitize_input(data['full_name'])
-    email = sanitize_input(data['email'])
-    username = sanitize_input(data['username'])
-    password = data['password']
+        return jsonify({"error": "Заполните все поля"}), 400
     
-    for val_func, val_data in [(validate_full_name, full_name), (validate_email, email), (validate_username, username), (validate_password, password)]:
-        is_ok, msg = val_func(val_data)
-        if not is_ok: return jsonify({"error": msg}), 400
-        
+    if len(data['password']) < 6:
+        return jsonify({"error": "Пароль должен быть минимум 6 символов"}), 400
+    
+    if '@' not in data['email'] or '.' not in data['email']:
+        return jsonify({"error": "Неверный формат email"}), 400
+    
+    full_name = data['full_name']
+    email = data['email']
+    username = data['username']
+    hashed_password = generate_password_hash(data['password'])
+    
     conn = get_db()
-    if conn.execute("SELECT id FROM users WHERE email = ? OR username = ?", (email, username)).fetchone():
-        conn.close()
-        return jsonify({"error": "Пользователь с таким Email или Логином уже существует"}), 400
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO users (full_name, email, username, password, bonus_points) VALUES (?, ?, ?, ?, ?)",
+            (full_name, email, username, hashed_password, 50)
+        )
+        conn.commit()
+        user_id = cursor.lastrowid
         
-    hashed_pw = generate_password_hash(password)
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO users (username, email, password, full_name, bonus_points) VALUES (?, ?, ?, ?, 0)",
-        (username, email, hashed_pw, full_name)
-    )
-    user_id = cursor.lastrowid
-    
-    # Сразу создаем запись для бонусов во избежание NULL-крашей
-    cursor.execute("INSERT INTO daily_bonus (user_id, last_claim_date, streak) VALUES (?, NULL, 0)", (user_id,))
-    conn.commit()
-    conn.close()
-    
-    return jsonify({"success": True, "message": "Регистрация успешна!"}), 201
+        # Записываем бонус за регистрацию
+        cursor.execute(
+            "INSERT INTO bonus_transactions (user_id, amount, reason) VALUES (?, ?, ?)",
+            (user_id, 50, 'Регистрация')
+        )
+        conn.commit()
+        conn.close()
+        
+        return jsonify({"message": "Регистрация успешна! Вы получили 50 бонусов", "user_id": user_id}), 201
+    except Exception as e:
+        conn.close()
+        if "UNIQUE" in str(e):
+            return jsonify({"error": "Пользователь с таким email или логином уже существует"}), 400
+        return jsonify({"error": str(e)}), 500
 
 @bp.route('/login', methods=['POST', 'OPTIONS'])
 def login():
-    if request.method == 'OPTIONS': return '', 200
+    # Обработка preflight запроса
+    if request.method == 'OPTIONS':
+        return '', 200
+    
     data = request.get_json()
     
+    if not data or 'username' not in data or 'password' not in data:
+        return jsonify({"error": "Введите логин и пароль"}), 400
+    
     conn = get_db()
-    user = conn.execute("SELECT * FROM users WHERE username = ?", (data.get('username'),)).fetchone()
+    user = conn.execute("SELECT * FROM users WHERE username = ?", (data['username'],)).fetchone()
     conn.close()
     
-    if user and check_password_hash(user['password'], data.get('password')):
-        secret = current_app.config.get('JWT_SECRET_KEY') or 'dev-jwt-key-secure-2026'
-        token = jwt.encode({
-            'user_id': user['id'],
-            'exp': datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=7)
-        }, secret, algorithm='HS256')
-        
+    if user and check_password_hash(user['password'], data['password']):
+        access_token, refresh_token = generate_tokens(user['id'])
         return jsonify({
-            "token": token,
+            "message": "Успешный вход",
+            "access_token": access_token,
+            "refresh_token": refresh_token,
             "user": {
                 "id": user['id'],
-                "username": user['username'],
                 "full_name": user['full_name'],
+                "email": user['email'],
+                "username": user['username'],
                 "bonus_points": user['bonus_points']
             }
         }), 200
-    return jsonify({"error": "Неверный логин или пароль"}), 401
+    else:
+        return jsonify({"error": "Неверный логин или пароль"}), 401
+
+@bp.route('/refresh', methods=['POST', 'OPTIONS'])
+def refresh():
+    """Обновление access токена по refresh токену"""
+    if request.method == 'OPTIONS':
+        return '', 200
+    
+    data = request.get_json()
+    refresh_token = data.get('refresh_token')
+    
+    if not refresh_token:
+        return jsonify({"error": "Refresh token отсутствует"}), 401
+    
+    try:
+        payload = jwt.decode(refresh_token, os.getenv('JWT_SECRET_KEY', 'dev-secret-key'), algorithms=['HS256'])
+        user_id = payload['user_id']
+        new_access_token, _ = generate_tokens(user_id)
+        return jsonify({"access_token": new_access_token}), 200
+    except jwt.ExpiredSignatureError:
+        return jsonify({"error": "Refresh token истёк, войдите заново"}), 401
+    except jwt.InvalidTokenError:
+        return jsonify({"error": "Недействительный refresh token"}), 401
